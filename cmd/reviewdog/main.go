@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,10 +16,11 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"code.gitea.io/sdk/gitea"
 	"golang.org/x/build/gerrit"
 	"golang.org/x/oauth2"
 
-	"github.com/google/go-github/v53/github"
+	"github.com/google/go-github/v60/github"
 	"github.com/mattn/go-shellwords"
 	"github.com/reviewdog/errorformat/fmts"
 	"github.com/xanzy/go-gitlab"
@@ -32,8 +33,8 @@ import (
 	"github.com/reviewdog/reviewdog/project"
 	bbservice "github.com/reviewdog/reviewdog/service/bitbucket"
 	gerritservice "github.com/reviewdog/reviewdog/service/gerrit"
+	giteaservice "github.com/reviewdog/reviewdog/service/gitea"
 	githubservice "github.com/reviewdog/reviewdog/service/github"
-	"github.com/reviewdog/reviewdog/service/github/githubutils"
 	gitlabservice "github.com/reviewdog/reviewdog/service/gitlab"
 )
 
@@ -60,6 +61,7 @@ type option struct {
 	tee              bool
 	filterMode       filter.Mode
 	failOnError      bool
+	logLevel         string
 }
 
 const (
@@ -87,7 +89,7 @@ const (
 		"nofilter"
 			Do not filter any results.
 `
-	reporterDoc = `reporter of reviewdog results. (local, github-check, github-pr-check, github-pr-review, gitlab-mr-discussion, gitlab-mr-commit)
+	reporterDoc = `reporter of reviewdog results. (local, github-check, github-pr-check, github-pr-review, gitlab-mr-discussion, gitlab-mr-commit, gitea-pr-review)
 	"local" (default)
 		Report results to stdout.
 
@@ -167,7 +169,16 @@ const (
 		
 		To post results to Bitbucket Server specify BITBUCKET_SERVER_URL.
 
-	For GitHub Enterprise and self hosted GitLab, set
+	"gitea-pr-review"
+		Report results to Gitea review comments.
+
+		1. Set REVIEWDOG_GITEA_API_TOKEN environment variable.
+		Go to https://<gitea-server>/user/settings/applications and create new Access Token token with repo scope.
+		2. Set GITEA_ADDRESS environment variable to your Gitea server base address.
+		For example:
+			$ export GITEA_ADDRESS=http://localhost:3000
+
+	For GitHub Enterprise and self hosted GitLab or Gitea, set
 	REVIEWDOG_INSECURE_SKIP_VERIFY to skip verifying SSL (please use this at your own risk)
 		$ export REVIEWDOG_INSECURE_SKIP_VERIFY=true
 
@@ -182,6 +193,7 @@ const (
 		$ export CI_REPO_NAME="reviewdog" # repository name
 `
 	failOnErrorDoc = `Returns 1 as exit code if any errors/warnings found in input`
+	logLevelDoc    = `log level for reviewdog itself. (debug, info, warning, error)`
 )
 
 var opt = &option{}
@@ -203,6 +215,7 @@ func init() {
 	flag.BoolVar(&opt.tee, "tee", false, teeDoc)
 	flag.Var(&opt.filterMode, "filter-mode", filterModeDoc)
 	flag.BoolVar(&opt.failOnError, "fail-on-error", false, failOnErrorDoc)
+	flag.StringVar(&opt.logLevel, "log-level", "info", logLevelDoc)
 }
 
 func usage() {
@@ -212,6 +225,29 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "See https://github.com/reviewdog/reviewdog for more detail.")
 	os.Exit(2)
+}
+
+func configureLogger(ctx context.Context, logLevel string) {
+	var lv slog.Level
+	switch logLevel {
+	case "debug":
+		lv = slog.LevelDebug
+	case "info":
+		lv = slog.LevelInfo
+	case "warning":
+		lv = slog.LevelWarn
+	case "error":
+		lv = slog.LevelError
+	default:
+		slog.WarnContext(ctx, "unknown log level", "log-level", logLevel)
+	}
+
+	opts := &slog.HandlerOptions{
+		Level: lv,
+	}
+	h := slog.NewTextHandler(os.Stderr, opts)
+	logger := slog.New(h)
+	slog.SetDefault(logger)
 }
 
 func main() {
@@ -225,6 +261,8 @@ func main() {
 
 func run(r io.Reader, w io.Writer, opt *option) error {
 	ctx := context.Background()
+
+	configureLogger(ctx, opt.logLevel)
 
 	if opt.version {
 		fmt.Fprintln(w, commands.Version)
@@ -262,9 +300,11 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 	default:
 		return fmt.Errorf("unknown -reporter: %s", opt.reporter)
 	case "github-check":
-		return runDoghouse(ctx, r, w, opt, isProject, false)
+		return runDoghouse(ctx, r, w, opt, isProject, false, false)
 	case "github-pr-check":
-		return runDoghouse(ctx, r, w, opt, isProject, true)
+		return runDoghouse(ctx, r, w, opt, isProject, true, false)
+	case "github-pr-annotations":
+		return runDoghouse(ctx, r, w, opt, isProject, true, true)
 	case "github-pr-review":
 		gs, isPR, err := githubService(ctx, opt)
 		if err != nil {
@@ -274,21 +314,7 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 			fmt.Fprintln(os.Stderr, "reviewdog: this is not PullRequest build.")
 			return nil
 		}
-		// If it's running in GitHub Actions and it's PR from forked repository,
-		// replace comment writer to GitHubActionLogWriter to create annotations
-		// instead of review comment because if it's PR from forked repository,
-		// GitHub token doesn't have write permission due to security concern and
-		// cannot post results via Review API.
-		if cienv.IsInGitHubAction() && cienv.HasReadOnlyPermissionGitHubToken() {
-			fmt.Fprintln(os.Stderr, `reviewdog: This GitHub token doesn't have write permission of Review API [1], 
-so reviewdog will report results via logging command [2] and create annotations similar to
-github-pr-check reporter as a fallback.
-[1]: https://docs.github.com/en/actions/reference/events-that-trigger-workflows#pull_request_target, 
-[2]: https://help.github.com/en/actions/automating-your-workflow-with-github-actions/development-tools-for-github-actions#logging-commands`)
-			cs = githubutils.NewGitHubActionLogWriter(opt.level)
-		} else {
-			cs = reviewdog.MultiCommentService(gs, cs)
-		}
+		cs = reviewdog.MultiCommentService(gs, cs)
 		ds = gs
 	case "gitlab-mr-discussion":
 		build, cli, err := gitlabBuildWithClient()
@@ -364,10 +390,21 @@ github-pr-check reporter as a fallback.
 			// filtering of annotations dividing them in two groups:
 			// - This pull request (10)
 			// - All (50)
-			log.Printf("reviewdog: [bitbucket-code-report] supports only with filter.ModeNoFilter for now")
+			slog.WarnContext(ctx, "reviewdog: [bitbucket-code-report] supports only with filter.ModeNoFilter for now")
 		}
 		opt.filterMode = filter.ModeNoFilter
 		ds = &reviewdog.EmptyDiff{}
+	case "gitea-pr-review":
+		gs, isPR, err := giteaService(ctx, opt)
+		if err != nil {
+			return err
+		}
+		if !isPR {
+			slog.ErrorContext(ctx, "reviewdog: this is not PullRequest build.")
+			return nil
+		}
+		cs = reviewdog.MultiCommentService(gs, cs)
+		ds = gs
 	case "local":
 		if opt.diffCmd == "" && opt.filterMode == filter.ModeNoFilter {
 			ds = &reviewdog.EmptyDiff{}
@@ -399,6 +436,7 @@ func runList(w io.Writer) error {
 	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "rdjsonl", "Reviewdog Diagnostic JSONL Format (JSONL of Diagnostic message)", "https://github.com/reviewdog/reviewdog")
 	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "diff", "Unified Diff Format", "https://en.wikipedia.org/wiki/Diff#Unified_format")
 	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "checkstyle", "checkstyle XML format", "http://checkstyle.sourceforge.net/")
+	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "sarif", "SARIF JSON format", "https://sarifweb.azurewebsites.net/")
 	for _, f := range sortedFmts(fmts.DefinedFmts()) {
 		fmt.Fprintf(tabw, "%s\t%s\t- %s\n", f.Name, f.Description, f.URL)
 	}
@@ -445,6 +483,111 @@ func insecureSkipVerify() bool {
 	return os.Getenv("REVIEWDOG_INSECURE_SKIP_VERIFY") == "true"
 }
 
+func giteaService(ctx context.Context, opt *option) (gs *giteaservice.PullRequest, isPR bool, err error) {
+	token, err := nonEmptyEnv("REVIEWDOG_GITEA_API_TOKEN")
+	if err != nil {
+		return nil, isPR, err
+	}
+
+	giteaAddr := os.Getenv("GITEA_ADDRESS")
+	if giteaAddr == "" {
+		return nil, isPR, errors.New("cannot get Gitea host address from environment variable. Set GITEA_ADDRESS ?")
+	}
+
+	g, isPR, err := cienv.GetBuildInfo()
+	if err != nil {
+		return nil, isPR, err
+	}
+
+	client, err := giteaClient(ctx, giteaAddr, token)
+	if err != nil {
+		return nil, isPR, err
+	}
+
+	if !isPR {
+		if !opt.guessPullRequest {
+			return nil, false, nil
+		}
+
+		if g.Branch == "" && g.SHA == "" {
+			return nil, false, nil
+		}
+
+		prID, err := getGiteaPullRequestIDByBranchOrCommit(client, g)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return nil, false, nil
+		}
+		g.PullRequest = int(prID)
+	}
+
+	gs, err = giteaservice.NewGiteaPullRequest(client, g.Owner, g.Repo, int64(g.PullRequest), g.SHA)
+	if err != nil {
+		return nil, false, err
+	}
+	return gs, true, nil
+}
+
+func getGiteaPullRequestIDByBranchOrCommit(client *gitea.Client, info *cienv.BuildInfo) (int64, error) {
+	options := gitea.ListPullRequestsOptions{
+		Sort:  "updated",
+		State: gitea.StateOpen,
+		ListOptions: gitea.ListOptions{
+			Page:     1,
+			PageSize: 100,
+		},
+	}
+
+	for {
+		pullRequests, resp, err := client.ListRepoPullRequests(info.Owner, info.Repo, options)
+		if err != nil {
+			return 0, err
+		}
+
+		for _, pr := range pullRequests {
+			if info.Branch != "" && info.Branch == pr.Head.Name {
+				return pr.Index, nil
+			}
+			if info.SHA != "" && info.SHA == pr.Head.Sha {
+				return pr.Index, nil
+			}
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		options.Page = resp.NextPage
+	}
+
+	// Build query just for error output
+	query := []string{
+		"type:pr",
+		"state:open",
+		fmt.Sprintf("repo:%s/%s", info.Owner, info.Repo),
+	}
+	if info.Branch != "" {
+		query = append(query, fmt.Sprintf("head:%s", info.Branch))
+	}
+	if info.SHA != "" {
+		query = append(query, info.SHA)
+	}
+
+	return 0, fmt.Errorf("reviewdog: PullRequest not found, query: %s", strings.Join(query, " "))
+}
+
+func giteaClient(ctx context.Context, url, token string) (*gitea.Client, error) {
+	client, err := gitea.NewClient(url,
+		gitea.SetContext(ctx),
+		gitea.SetToken(token),
+		gitea.SetHTTPClient(newHTTPClient()),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, client.CheckServerVersionConstraint(">=1.17.0")
+}
+
 func githubService(ctx context.Context, opt *option) (gs *githubservice.PullRequest, isPR bool, err error) {
 	token, err := nonEmptyEnv("REVIEWDOG_GITHUB_API_TOKEN")
 	if err != nil {
@@ -477,7 +620,7 @@ func githubService(ctx context.Context, opt *option) (gs *githubservice.PullRequ
 		g.PullRequest = prID
 	}
 
-	gs, err = githubservice.NewGitHubPullRequest(client, g.Owner, g.Repo, g.PullRequest, g.SHA)
+	gs, err = githubservice.NewGitHubPullRequest(client, g.Owner, g.Repo, g.PullRequest, g.SHA, opt.level)
 	if err != nil {
 		return nil, false, err
 	}
@@ -638,8 +781,8 @@ func bitbucketBuildWithClient(ctx context.Context) (*cienv.BuildInfo, bbservice.
 func fetchMergeRequestIDFromCommit(cli *gitlab.Client, projectID, sha string) (id int, err error) {
 	// https://docs.gitlab.com/ce/api/merge_requests.html#list-project-merge-requests
 	opt := &gitlab.ListProjectMergeRequestsOptions{
-		State:   gitlab.String("opened"),
-		OrderBy: gitlab.String("updated_at"),
+		State:   gitlab.Ptr("opened"),
+		OrderBy: gitlab.Ptr("updated_at"),
 	}
 	mrs, _, err := cli.MergeRequests.ListProjectMergeRequests(projectID, opt)
 	if err != nil {

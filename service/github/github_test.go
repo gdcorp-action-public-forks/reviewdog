@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-github/v53/github"
+	"github.com/google/go-github/v60/github"
 	"github.com/kylelemons/godebug/pretty"
 	"golang.org/x/oauth2"
 
@@ -67,7 +67,7 @@ func TestGitHubPullRequest_Post(t *testing.T) {
 	pr := 2
 	sha := "cce89afa9ac5519a7f5b1734db2e3aa776b138a7"
 
-	g, err := NewGitHubPullRequest(client, owner, repo, pr, sha)
+	g, err := NewGitHubPullRequest(client, owner, repo, pr, sha, "warning")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +79,7 @@ func TestGitHubPullRequest_Post(t *testing.T) {
 				},
 				Message: "[reviewdog] test",
 			},
+			InDiffFile:    true,
 			InDiffContext: true,
 		},
 	}
@@ -149,7 +150,7 @@ index 61450f3..f63f149 100644
 	owner := "haya14busa"
 	repo := "reviewdog"
 	pr := 2
-	g, err := NewGitHubPullRequest(client, owner, repo, pr, "")
+	g, err := NewGitHubPullRequest(client, owner, repo, pr, "", "warning")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +175,7 @@ func TestGitHubPullRequest_comment(t *testing.T) {
 	owner := "haya14busa"
 	repo := "reviewdog"
 	pr := 2
-	g, err := NewGitHubPullRequest(client, owner, repo, pr, "")
+	g, err := NewGitHubPullRequest(client, owner, repo, pr, "", "warning")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,46 +204,64 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 	postCommentsAPICalled := 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/o/r/pulls/14/comments", func(w http.ResponseWriter, r *http.Request) {
-		listCommentsAPICalled++
-		if r.Method != http.MethodGet {
-			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
-		}
-		switch r.URL.Query().Get("page") {
+		switch r.Method {
+		case http.MethodGet:
+			listCommentsAPICalled++
+			switch r.URL.Query().Get("page") {
+			default:
+				cs := []*github.PullRequestComment{
+					{
+						Path:        github.String("reviewdog.go"),
+						Line:        github.Int(2),
+						Body:        github.String(commentutil.BodyPrefix + "already commented"),
+						SubjectType: github.String("line"),
+					},
+				}
+				w.Header().Add("Link", `<https://api.github.com/repos/o/r/pulls/14/comments?page=2>; rel="next"`)
+				if err := json.NewEncoder(w).Encode(cs); err != nil {
+					t.Fatal(err)
+				}
+			case "2":
+				cs := []*github.PullRequestComment{
+					{
+						Path:        github.String("reviewdog.go"),
+						Line:        github.Int(15),
+						Body:        github.String(commentutil.BodyPrefix + "already commented 2"),
+						SubjectType: github.String("line"),
+					},
+					{
+						Path:        github.String("reviewdog.go"),
+						StartLine:   github.Int(15),
+						Line:        github.Int(16),
+						Body:        github.String(commentutil.BodyPrefix + "multiline existing comment"),
+						SubjectType: github.String("line"),
+					},
+					{
+						Path:        github.String("reviewdog.go"),
+						StartLine:   github.Int(15),
+						Line:        github.Int(17),
+						Body:        github.String(commentutil.BodyPrefix + "multiline existing comment (line-break)"),
+						SubjectType: github.String("line"),
+					},
+					{
+						Path:        github.String("reviewdog.go"),
+						Line:        github.Int(1),
+						Body:        github.String(commentutil.BodyPrefix + "existing file comment (no-line)"),
+						SubjectType: github.String("file"),
+					},
+					{
+						Path:        github.String("reviewdog.go"),
+						Line:        github.Int(1),
+						Body:        github.String(commentutil.BodyPrefix + "existing file comment (outside diff-context)"),
+						SubjectType: github.String("file"),
+					},
+				}
+				if err := json.NewEncoder(w).Encode(cs); err != nil {
+					t.Fatal(err)
+				}
+			}
 		default:
-			cs := []*github.PullRequestComment{
-				{
-					Path: github.String("reviewdog.go"),
-					Line: github.Int(2),
-					Body: github.String(commentutil.BodyPrefix + "already commented"),
-				},
-			}
-			w.Header().Add("Link", `<https://api.github.com/repos/o/r/pulls/14/comments?page=2>; rel="next"`)
-			if err := json.NewEncoder(w).Encode(cs); err != nil {
-				t.Fatal(err)
-			}
-		case "2":
-			cs := []*github.PullRequestComment{
-				{
-					Path: github.String("reviewdog.go"),
-					Line: github.Int(15),
-					Body: github.String(commentutil.BodyPrefix + "already commented 2"),
-				},
-				{
-					Path:      github.String("reviewdog.go"),
-					StartLine: github.Int(15),
-					Line:      github.Int(16),
-					Body:      github.String(commentutil.BodyPrefix + "multiline existing comment"),
-				},
-				{
-					Path:      github.String("reviewdog.go"),
-					StartLine: github.Int(15),
-					Line:      github.Int(17),
-					Body:      github.String(commentutil.BodyPrefix + "multiline existing comment (line-break)"),
-				},
-			}
-			if err := json.NewEncoder(w).Encode(cs); err != nil {
-				t.Fatal(err)
-			}
+			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
 		}
 	})
 	mux.HandleFunc("/repos/o/r/pulls/14/reviews", func(w http.ResponseWriter, r *http.Request) {
@@ -486,7 +505,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 
 	cli := github.NewClient(nil)
 	cli.BaseURL, _ = url.Parse(ts.URL + "/")
-	g, err := NewGitHubPullRequest(cli, "o", "r", 14, "sha")
+	g, err := NewGitHubPullRequest(cli, "o", "r", 14, "sha", "warning")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,6 +523,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "already commented",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -520,6 +540,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "already commented 2",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -536,6 +557,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "new comment",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -555,6 +577,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "multiline existing comment",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -576,6 +599,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "multiline existing comment (line-break)",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -595,6 +619,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "multiline new comment",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -607,6 +632,68 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "should not be reported via GitHub Review API",
 				},
+				InDiffFile:    false,
+				InDiffContext: false,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						// No Line
+					},
+					Message: "file comment (no-line)",
+				},
+				InDiffFile:    true,
+				InDiffContext: false,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						// No Line
+					},
+					Message: "existing file comment (no-line)",
+				},
+				InDiffFile:    true,
+				InDiffContext: false,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 18,
+							},
+						},
+					},
+					Message: "file comment (outside diff-context)",
+				},
+				InDiffFile:    true,
+				InDiffContext: false,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 18,
+							},
+						},
+					},
+					Message: "existing file comment (outside diff-context)",
+				},
+				InDiffFile:    true,
+				InDiffContext: false,
 			},
 		},
 		{
@@ -638,6 +725,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "multiline suggestion comment",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -664,6 +752,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "singleline suggestion comment",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -696,6 +785,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "invalid lines suggestion comment",
 				},
+				InDiffFile:                   true,
 				InDiffContext:                true,
 				FirstSuggestionInDiffContext: false,
 			},
@@ -731,6 +821,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "Use suggestion range as GitHub comment range if the suggestion is in diff context",
 				},
+				InDiffFile:                   true,
 				InDiffContext:                true,
 				FirstSuggestionInDiffContext: true,
 			},
@@ -777,6 +868,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "Partially invalid suggestions",
 				},
+				InDiffFile:                   true,
 				InDiffContext:                true,
 				FirstSuggestionInDiffContext: true,
 			},
@@ -812,6 +904,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "non-line based suggestion comment (no source lines)",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -837,6 +930,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "range suggestion (single line)",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -865,6 +959,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "range suggestion (multi-line)",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -894,6 +989,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "range suggestion (line-break, remove)",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -921,6 +1017,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "range suggestion (insert)",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -960,6 +1057,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "multiple suggestions",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -984,6 +1082,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "range suggestion with start only location",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -1016,6 +1115,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "multiline suggestion comment including a code fence block",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -1042,6 +1142,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "singleline suggestion comment including a code fence block",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -1074,6 +1175,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 					},
 					Message: "multiline suggestion comment including an empty code fence block",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 		},
@@ -1125,7 +1227,7 @@ func TestGitHubPullRequest_Post_toomany(t *testing.T) {
 
 	cli := github.NewClient(nil)
 	cli.BaseURL, _ = url.Parse(ts.URL + "/")
-	g, err := NewGitHubPullRequest(cli, "o", "r", 14, "sha")
+	g, err := NewGitHubPullRequest(cli, "o", "r", 14, "sha", "warning")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1142,6 +1244,7 @@ func TestGitHubPullRequest_Post_toomany(t *testing.T) {
 					},
 					Message: "comment",
 				},
+				InDiffFile:    true,
 				InDiffContext: true,
 			},
 			ToolName: "tool",
@@ -1169,7 +1272,7 @@ func TestGitHubPullRequest_workdir(t *testing.T) {
 	moveToRootDir()
 	defer setupEnvs()()
 
-	g, err := NewGitHubPullRequest(nil, "", "", 0, "")
+	g, err := NewGitHubPullRequest(nil, "", "", 0, "", "warning")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1188,7 +1291,7 @@ func TestGitHubPullRequest_workdir(t *testing.T) {
 	if err := os.Chdir(subDir); err != nil {
 		t.Fatal(err)
 	}
-	g, _ = NewGitHubPullRequest(nil, "", "", 0, "")
+	g, _ = NewGitHubPullRequest(nil, "", "", 0, "", "warning")
 	if g.wd != subDir {
 		t.Fatalf("gitRelWorkdir() = %q, want %q", g.wd, subDir)
 	}
@@ -1219,7 +1322,7 @@ func TestGitHubPullRequest_Diff_fake(t *testing.T) {
 
 	cli := github.NewClient(nil)
 	cli.BaseURL, _ = url.Parse(ts.URL + "/")
-	g, err := NewGitHubPullRequest(cli, "o", "r", 14, "sha")
+	g, err := NewGitHubPullRequest(cli, "o", "r", 14, "sha", "warning")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1228,5 +1331,68 @@ func TestGitHubPullRequest_Diff_fake(t *testing.T) {
 	}
 	if apiCalled != 1 {
 		t.Errorf("GitHub API should be called once; called %v times", apiCalled)
+	}
+}
+
+func TestGitHubPullRequest_Post_NoPermission(t *testing.T) {
+	cwd, _ := os.Getwd()
+	defer os.Chdir(cwd)
+	moveToRootDir()
+	t.Setenv("GITHUB_ACTIONS", "true")
+
+	listCommentsAPICalled := 0
+	postCommentsAPICalled := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/pulls/14/comments", func(w http.ResponseWriter, r *http.Request) {
+		listCommentsAPICalled++
+		if err := json.NewEncoder(w).Encode([]*github.PullRequestComment{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	mux.HandleFunc("/repos/o/r/pulls/14/reviews", func(w http.ResponseWriter, r *http.Request) {
+		postCommentsAPICalled++
+		w.WriteHeader(http.StatusNotFound)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cli := github.NewClient(nil)
+	cli.BaseURL, _ = url.Parse(ts.URL + "/")
+	g, err := NewGitHubPullRequest(cli, "o", "r", 14, "sha", "warning")
+	if err != nil {
+		t.Fatal(err)
+	}
+	comments := []*reviewdog.Comment{
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "service/github/github_test.go",
+						Range: &rdf.Range{Start: &rdf.Position{
+							Line: 1,
+						}},
+					},
+					Message: "test message for TestGitHubPullRequest_Post_NoPermission",
+				},
+				InDiffFile:    true,
+				InDiffContext: true,
+			},
+			ToolName: "service/github/github_test.go",
+		},
+	}
+	for _, c := range comments {
+		if err := g.Post(context.Background(), c); err != nil {
+			t.Error(err)
+		}
+	}
+	if err := g.Flush(context.Background()); err != nil {
+		t.Error(err)
+	}
+	if want := 1; listCommentsAPICalled != want {
+		t.Errorf("GitHub List PullRequest comments API called %v times, want %d times", listCommentsAPICalled, want)
+	}
+	if want := 1; postCommentsAPICalled != want {
+		t.Errorf("GitHub post PullRequest comments API called %v times, want %d times", postCommentsAPICalled, want)
 	}
 }
